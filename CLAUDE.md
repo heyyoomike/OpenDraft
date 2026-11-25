@@ -227,22 +227,23 @@ cd backend; ..\venv\Scripts\python -m uvicorn app.main:app --reload --host 127.0
 ```
 
 ```powershell
-# Vite dev server — http://localhost:5173. On its own this is the web app (talks to the backend on 8008).
-cd frontend; npm run dev
+# Desktop app — run from the REPO ROOT. Starts Vite on 5173 itself; the first run compiles Rust for several minutes.
+frontend\node_modules\.bin\tauri dev
 ```
 
 ```powershell
-# Desktop app, from the REPO ROOT, with Vite already running. First run compiles Rust for several minutes.
-frontend\node_modules\.bin\tauri dev --config '{\"build\":{\"beforeDevCommand\":\"\"}}'
+# Web app in a browser instead — http://localhost:5173, talks to the backend on 8008
+cd frontend; npm run dev
 ```
 
-Why the desktop command looks like that: the Tauri CLI only finds
-`src-tauri/` from the repo root (from `frontend/` it panics "Couldn't
-recognize the current folder as a Tauri project"), but the configured
-`beforeDevCommand` is `cd ../frontend && npm run dev`, which fails from the
-root ("The system cannot find the path specified"). So start Vite yourself
-and blank out `beforeDevCommand`. In Git Bash the override is
-`--config '{"build":{"beforeDevCommand":""}}'`.
+- The Tauri CLI must run from the repo root: from `frontend/` it panics
+  "Couldn't recognize the current folder as a Tauri project". It also runs
+  `beforeDevCommand` / `beforeBuildCommand` from the root, which is why both
+  start with `cd frontend`.
+- If Vite is already running on 5173, `tauri dev` fails (`strictPort`). Stop
+  it, or reuse it with
+  `--config '{\"build\":{\"beforeDevCommand\":\"\"}}'`
+  (Git Bash: `--config '{"build":{"beforeDevCommand":""}}'`).
 
 - The **desktop app does not use the backend**: it stores data in local
   SQLite under `%APPDATA%\com.proteus.opendraft\`. To collaborate against
