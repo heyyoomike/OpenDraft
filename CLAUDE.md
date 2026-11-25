@@ -30,6 +30,236 @@ OpenDraft-Pro (private, proprietary)   ← imports this as git submodule at core
 
 ---
 
+## Codebase Map
+
+Four runnable pieces. The **desktop and mobile apps do not use the Python
+backend** — they store everything in local SQLite through Tauri. The backend
+only serves the **web** build (and `open-draft.com`).
+
+| Piece | Path | Stack | Dev port |
+|-------|------|-------|----------|
+| Frontend (all platforms) | `frontend/` | React 19, TypeScript, Vite, TipTap 2, Zustand | 5173 |
+| Desktop/mobile shell | `src-tauri/` | Tauri 2 (Rust) | — (loads 5173 in dev) |
+| Web API backend | `backend/` | FastAPI, per-project git (dulwich) | 8008 |
+| Collaboration server | `collab-server/` | Hocuspocus + Yjs, Express, SQLite/Postgres | 4000 |
+
+### Editor
+
+- `frontend/src/components/ScreenplayEditor.tsx` — the editor screen (~7k
+  lines): builds the TipTap editor, wires collaboration, hosts docks/panels,
+  menu bar and toolbar. Routes `/`, `/project/:id/edit/:scriptId`,
+  `/collab/:token` and history all render it (`App.tsx`).
+- `frontend/src/editor/extensions/` — one TipTap node/mark per screenplay
+  element (`SceneHeading`, `Action`, `Character`, `Dialogue`, `Parenthetical`,
+  `Transition`, `DualDialogue`, `Note`, `RevisionMark`, …), re-exported from
+  `index.ts`.
+- `frontend/src/editor/*.ts` — ProseMirror plugins and editor logic:
+  `pagination.ts`, `smartType.ts` (autocomplete), `contdAuto.ts`,
+  `revisionMarks.ts`, `suggestions.ts`/`trackChanges.ts`, `spellchecker.ts`,
+  `sceneReorder.ts`, `grammar/` providers.
+- `frontend/src/stores/editorStore.ts` — Zustand store for editor/session
+  state, including every panel's open flag (`navigatorOpen`,
+  `scriptNotesOpen`, `dialogueTunerOpen`, …).
+- `frontend/src/components/MenuBar.tsx` (menus + What's New),
+  `components/Toolbar.tsx` + `components/toolbar/` (toolbar,
+  `toolbarMeta.tsx` icons/labels per panel).
+- Import/export: `frontend/src/utils/` — `importScreenplay.ts` (entry point),
+  `fdxParser.ts`/`fdxExporter.ts`, `fountainParser.ts`/`fountainExporter.ts`,
+  `pdfExporter.ts`, `pdfImport.ts`, `docxExporter.ts`, `osfParser.ts`,
+  `odraftFormat.ts` (native format).
+- `frontend/src/components/TreatmentEditor.tsx` — the separate treatment editor.
+
+### Collaboration (Yjs / WebSocket)
+
+- **Client:** `ScreenplayEditor.tsx` creates a `HocuspocusProvider` (search
+  `new HocuspocusProvider`) and swaps TipTap's History for
+  `Collaboration` + `CollaborationCursor`.
+  - `services/collabSync.ts` — bridges a Yjs `metadata` Y.Map with Zustand
+    stores (character profiles, notes, tags, beats, synopses, template).
+  - `services/collabAuth.ts`, `services/reviewProtocol.ts`,
+    `services/rejectedCollabRecovery.ts`, `components/ShareDialog.tsx`,
+    `components/JoinCollabDialog.tsx`, `components/CollabLoginDialog.tsx`.
+  - Server URL: `config.ts` `getCollabWsUrl()` — localStorage
+    `opendraft:collabServerUrl` (Settings), else `VITE_COLLAB_WS_URL`, else
+    `wss://collab.open-draft.com`.
+- **Server:** `collab-server/src/server.ts` — Hocuspocus hooks
+  (`onAuthenticate` checks JWT/invite token and role, `onLoadDocument` /
+  `onStoreDocument` persist each Yjs doc as a binary update file under
+  `collab-server/data/`), plus Express routes: `routes/auth.ts` (accounts,
+  JWT), `routes/collab.ts` (sessions/invites), `routes/admin.ts`,
+  `routes/internal.ts`. `services/suggestionGuard.ts` enforces suggest-only
+  roles; `database/` has SQLite and Postgres adapters; `config.ts` reads env.
+- The collab server also owns **user accounts**; the backend validates its
+  JWTs with the shared secret (`COLLAB_JWT_SECRET` = collab's `JWT_SECRET`,
+  written by `setup_auth_env.sh`).
+
+### File storage
+
+`frontend/src/services/api.ts` exports `api`, the one storage interface. At
+start-up it picks an implementation:
+
+| Platform | Implementation | Where data lives |
+|----------|----------------|------------------|
+| Web | HTTP to `backend/` (`api.ts` itself, `authedFetch.ts`) | `backend/data/projects/users/<id>/` — one git repo per project (`backend/app/services/git_service.py`, `project_service.py`, `script_service.py`) |
+| Tauri (desktop/mobile) | `services/local-storage.ts` over `services/db.ts` | SQLite `opendraft.db` (WAL) in the app data dir; assets on disk next to it; versions are delta commits in SQLite |
+| Tauri, SQLite unusable | `file-fallback-storage.ts`, then `fallback-storage.ts` (localStorage) | — |
+
+- Scripts can also be **linked to files on disk** (`.odraft`, `.fountain`,
+  `.fdx`): `services/linkedFiles.ts`, `utils/linkedFileFormat.ts`,
+  `components/LinkedFileSync.tsx`; see `docs/PROJECT_STORAGE.md`.
+- Native file I/O (atomic save, file pickers, backups) is Rust:
+  `src-tauri/src/lib.rs` (`invoke_handler` lists every command),
+  `safe_file.rs`, `source_backups.rs`.
+- Backups/recovery: `services/backupService.ts`, `recoveryService.ts`,
+  `pendingSave.ts`. Device/cloud sync: `deviceProjectSync.ts`,
+  `offlineCloud.ts` (`docs/cloud-sync-merge.md`).
+- Backend API routers: `backend/app/api/` (`scripts`, `projects`,
+  `versions`, `assets`, `locations`, `collab`, `export`, `auth`, `admin`),
+  mounted in `backend/app/main.py`, which also serves `backend/static/` (the
+  built frontend) for self-hosting.
+
+### UI panels
+
+- **Built-in panels** live in `frontend/src/components/` (`SceneNavigator`,
+  `ScriptNotes`, `CharacterProfiles`, `TagsPanel`, `LocationDatabase`,
+  `SceneDetailsPanel`, `DialogueTuner`, `SuggestionsPanel`, `TableReadPanel`).
+- `utils/workspaceLayout.ts` — panel ids (`NAVIGATOR_PANELS`, `TOOL_PANELS`),
+  docks (`start` / `end` / `bottom`), groups and layout presets.
+- `utils/panelActions.ts` — maps panel ids to their open flags
+  (`panelOpenIn`) and open/close actions.
+- `ScreenplayEditor.tsx` — `dockPanels[...]` says how each panel renders in a
+  dock (search `Workspace docks`).
+- Pop-out windows: `components/PanelPopout.tsx`, `stores/panelPopoutStore.ts`,
+  `src-tauri/src/panel_windows.rs` (`docs/panel-windows.md`). A panel in a
+  pop-out renders into another `document` — use `ownerDocument`, not the
+  global `document`, for DOM work.
+- **Plugin/add-on panels** render in the "add-ons" strip via
+  `components/PluginPanelTabs.tsx` (`pluginRegistry.getPanels('right-sidebar')`);
+  `status-bar` panels render at the bottom of the editor.
+- Other views: `IndexCards.tsx`, `BeatBoard.tsx`, `OutlineView.tsx`,
+  `ScriptStatistics.tsx`, `ReportsDialog.tsx`.
+
+### Adding a new panel or tool
+
+Pick the route first:
+
+1. **Optional/opt-in tool → add-on** (preferred for anything a writer may not
+   want, and anything using the network). Create
+   `frontend/src/addons/<id>/index.ts` default-exporting an `OpenDraftPlugin`
+   with `optIn: true`, a `description` and a `privacy` statement, and add it
+   to `CORE_ADDONS` in `addons/index.ts`. Contribute through the registry:
+   `panels: [{ id, slot: 'right-sidebar', label, component }]`, `menuItems`
+   (`section: 'Tools'`, open your panel by dispatching
+   `PLUGIN_PANEL_OPEN_EVENT` with `{ panelId }`), `editorExtensions`,
+   `importers` / `exporters` / `reports`, `sceneActions`,
+   `grammarProviders`, `settings`. Nothing outside `src/addons/` may import
+   your add-on (`addons/boundary.test.ts` enforces it). Model:
+   `addons/dictation/index.ts`.
+2. **Commercial feature** → same plugin shape, but in OpenDraft-Pro, never here.
+3. **Built-in core panel** — touch every place the Dialogue Tuner (`'tuner'`)
+   appears:
+   - component in `components/` taking `editor` and `style`;
+   - `stores/editorStore.ts`: `xxxOpen` flag, `openXxx`/`closeXxx`, and
+     persist it via `saveViewState` like the others;
+   - `utils/workspaceLayout.ts`: add the id to `TOOL_PANELS` and to the
+     presets in `workspacePreset()`;
+   - `utils/panelActions.ts`: `usePanelOpen`, `OpenFlags`, `panelOpenIn`
+     and the show/hide switch;
+   - `ScreenplayEditor.tsx`: `openFlags` and `dockPanels.<id>.render`;
+   - `components/toolbar/toolbarMeta.tsx`: icon and label;
+   - `components/MenuBar.tsx`: View → Panels entry;
+   - strings in `frontend/src/locales/en/*.json` (and other locales —
+     `npm run i18n:check`, `docs/i18n.md`).
+4. **Backend endpoint** → router in `backend/app/api/`, include it in
+   `main.py` (or `register_router()` from a plugin). Remember desktop/mobile
+   never call it — mirror the behaviour in `services/local-storage.ts`.
+5. **Native capability** → `#[tauri::command]` in `src-tauri/src/`, add it
+   to `generate_handler![...]` in `lib.rs`, and allow it in
+   `src-tauri/capabilities/` if it needs a plugin permission.
+
+Tests: `cd frontend && npm test` (Vitest, tests sit next to sources),
+`npm run lint`, `npm run build` (runs `tsc -b`).
+
+---
+
+## Running locally on Windows
+
+The `start_*.sh` scripts assume macOS/Linux (`venv/bin`, `source .env`). The
+equivalents below were verified on Windows 11 with Python 3.12, Node 24,
+Rust 1.96 and VS 2022 Build Tools (C++ workload; WebView2 is built in).
+
+One-time setup (Git Bash for the first command — it needs `openssl`):
+
+```bash
+./setup_auth_env.sh   # writes backend/.env + collab-server/.env with a shared JWT secret
+```
+
+- It also rewrites `backend/.env.example` and `collab-server/.env.example`;
+  `git checkout` them afterwards.
+- It writes `COLLAB_DB_PATH` as a Git Bash path (`/d/...`). Change it to a
+  Windows path in `backend/.env`, e.g.
+  `COLLAB_DB_PATH=D:/OpenDraft/collab-server/data/collab.sqlite3`.
+
+```powershell
+py -3.12 -m venv venv
+venv\Scripts\pip install -r backend\requirements.txt
+npm ci --prefix collab-server
+npm ci --prefix frontend
+```
+
+If an `npm ci` ends with `ENOTEMPTY` / `TAR_ENTRY_ERROR`, or packages come out
+half-extracted (no `node_modules\.bin`, `Cannot find module 'better-sqlite3'`),
+Defender or the indexer was holding files. Delete the folder with
+`Remove-Item node_modules -Recurse -Force` and run `npm ci` again; excluding
+the repo from Defender scanning avoids it.
+
+Run, each in its own terminal:
+
+```powershell
+# Collaboration server — ws://localhost:4000 (reads collab-server/.env itself)
+cd collab-server; npm run dev
+```
+
+```powershell
+# Web API backend — http://localhost:8008 (docs at /docs). It does not read .env itself.
+Get-Content backend\.env | Where-Object { $_ -match '^[A-Z_]+=' } | ForEach-Object { $k,$v = $_ -split '=',2; Set-Item "env:$k" $v }
+cd backend; ..\venv\Scripts\python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8008
+```
+
+```powershell
+# Vite dev server — http://localhost:5173. On its own this is the web app (talks to the backend on 8008).
+cd frontend; npm run dev
+```
+
+```powershell
+# Desktop app, from the REPO ROOT, with Vite already running. First run compiles Rust for several minutes.
+frontend\node_modules\.bin\tauri dev --config '{\"build\":{\"beforeDevCommand\":\"\"}}'
+```
+
+Why the desktop command looks like that: the Tauri CLI only finds
+`src-tauri/` from the repo root (from `frontend/` it panics "Couldn't
+recognize the current folder as a Tauri project"), but the configured
+`beforeDevCommand` is `cd ../frontend && npm run dev`, which fails from the
+root ("The system cannot find the path specified"). So start Vite yourself
+and blank out `beforeDevCommand`. In Git Bash the override is
+`--config '{"build":{"beforeDevCommand":""}}'`.
+
+- The **desktop app does not use the backend**: it stores data in local
+  SQLite under `%APPDATA%\com.proteus.opendraft\`. To collaborate against
+  the local collab server, set Settings → Collaboration Server → Server URL
+  to `ws://localhost:4000` (default is `wss://collab.open-draft.com`).
+- The root `node_modules` file is a git symlink to `frontend/node_modules`;
+  on Windows without symlink support it checks out as a text file, so
+  `npm run tauri` from the root does not work — call
+  `frontend\node_modules\.bin\tauri` directly, as above.
+- Without SMTP configured, the collab server prints sign-up verification
+  codes to its console.
+- A Windows `tauri dev` rewrites `src-tauri/gen/schemas/*.json` (and adds
+  `windows-schema.json`) and can flip `src-tauri/Cargo.toml` line endings.
+  Don't commit those by accident.
+
+---
+
 ## macOS Desktop Build — Code Signing & Notarization
 
 The macOS `.dmg` is built via **GitHub Actions** (in `.github/workflows/release.yml`), same as Windows, Linux, and Android. It is signed and notarized automatically when the correct GitHub secrets are configured.
