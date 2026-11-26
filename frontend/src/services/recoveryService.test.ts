@@ -411,6 +411,52 @@ describe('recoveryService', () => {
     /** Let a ping and its answers cross between the simulated tabs. */
     const settle = () => new Promise((resolve) => setTimeout(resolve, 30));
 
+    /**
+     * Open a tab and wait until it has heard `holder` say which slot it is
+     * using.
+     *
+     * A fixed {@link settle} is not enough when a test depends on that answer:
+     * the ping and the reply each cross the channel, and with the whole suite
+     * running in parallel that can take longer than 30 ms. Polling the check
+     * instead is no good either — `readRecoverableSnapshot()` claims what it
+     * returns, so an early poll would change the outcome. So the new tab's
+     * channel is wrapped to say when it has handled the holder's "here".
+     *
+     * It has to be the holder's: the instance this file imports at the top
+     * answers pings too, so the first "here" to arrive is often not the one
+     * the test is about.
+     */
+    const newTabThatHearsFrom = async (holder: typeof import('./recoveryService')) => {
+      const slot = holder.recoverySlotKey();
+      const Real = globalThis.BroadcastChannel;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let heard!: () => void;
+      const answered = new Promise<void>((resolve, reject) => {
+        heard = resolve;
+        timer = setTimeout(() => reject(new Error(`${slot} was not answered for within 2 s`)), 2000);
+      });
+      class Listening extends Real {
+        set onmessage(handler: ((this: BroadcastChannel, ev: MessageEvent) => unknown) | null) {
+          super.onmessage = (event: MessageEvent) => {
+            handler?.call(this, event);
+            if (event.data?.type === 'here' && event.data.slot === slot) heard();
+          };
+        }
+        get onmessage() {
+          return super.onmessage;
+        }
+      }
+      globalThis.BroadcastChannel = Listening;
+      try {
+        const tab = await newTab();
+        await answered;
+        return tab;
+      } finally {
+        globalThis.BroadcastChannel = Real;
+        clearTimeout(timer);
+      }
+    };
+
     /** Every tab this test opened, so none is left answering the next one. */
     const open: (typeof import('./recoveryService'))[] = [];
 
@@ -519,8 +565,7 @@ describe('recoveryService', () => {
       const first = await newTab();
       write(first, 'Being edited in the first tab right now');
 
-      const second = await newTab();
-      await settle(); // the ping and the answer
+      const second = await newTabThatHearsFrom(first);
       expect(second.readRecoverableSnapshot()).toBeNull();
       expect(second.hasRecoverableSnapshot()).toBe(false);
     });
@@ -529,8 +574,7 @@ describe('recoveryService', () => {
       const first = await newTab();
       write(first, 'Unsaved when the tab went away');
 
-      const second = await newTab();
-      await settle();
+      const second = await newTabThatHearsFrom(first);
       expect(second.readRecoverableSnapshot()).toBeNull();
 
       first.closeRecoveryPresence();
